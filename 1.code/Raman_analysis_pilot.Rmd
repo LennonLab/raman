@@ -1,0 +1,1324 @@
+---
+title: "Raman single-cell spectroscopy: reproducible analysis"
+author: "Jay T. Lennon"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: pdf_document
+geometry: margin=2.54cm
+header-includes:
+  - \usepackage{array}
+---
+
+# Overview
+
+This analysis asks whether single-cell Raman spectra distinguish Bacillus endospores from vegetative cells and whether fixation changes Raman signatures.
+
+The primary biological experiment is a 2 x 2 design:
+
+| Cell state | Unfixed | Fixed |
+|---|---|---|
+| Endospore | psu | psf |
+| Vegetative | pvu | pvf |
+
+Soil blanks (sbu/sbf) are retained in the imported dataset but excluded from the biological 2 x 2 analysis.
+
+The processing sequence used here is:
+
+**import -> metadata -> QC for near-ceiling spectra -> CaDPA benchmark -> fingerprint selection -> ALS baseline correction -> L2/vector normalization -> PCA -> acquisition/run QC**.
+
+The CaDPA analysis is intentionally kept separate from the whole-spectrum analysis so that the known endospore-associated feature provides a simple biological benchmark for any later multivariate classifier.
+
+## 1. Setup
+
+```{r setup}
+rm(list = ls())
+
+suppressPackageStartupMessages({
+  library(here)
+  library(data.table)
+  library(dplyr)
+  library(Matrix)
+  library(pROC)
+})
+
+# ------------------------------------------------------------
+# Project paths
+# ------------------------------------------------------------
+
+# here() should resolve to the root of the "raman" repository
+project_dir <- here()
+
+# Input data
+data_dir <- here("2.data")
+
+# Analysis outputs and figures
+output_dir <- here("3.output")
+
+# Raman matrix
+input_file <- here(
+  "2.data",
+  "raman_cell_matrix.tsv"
+)
+
+
+# Consistent colors for the four biological groups
+# (used only for figures; not part of the analysis itself)
+group_colors <- c(
+  "vegetative_unfixed" = "steelblue",
+  "endospore_unfixed" = "firebrick",
+  "vegetative_fixed" = "skyblue3",
+  "endospore_fixed" = "orange3"
+)
+
+```
+
+# 2. Import the assembled Raman matrix
+
+The assembled matrix has Raman positions in rows and individual spectra/cells in columns. Column names retain the original processed-file identifiers so that acquisition time can later be recovered from the filename.
+
+```{r import}
+raman <- fread(
+  input_file,
+  sep = "\t",
+  header = TRUE,
+  check.names = FALSE
+)
+
+raman_shift <- as.numeric(raman[[1]])
+
+spectra <- as.matrix(
+  raman[, -1, with = FALSE]
+)
+storage.mode(spectra) <- "numeric"
+
+cell_id <- colnames(spectra)
+
+cat("Raman matrix dimensions:\n")
+print(dim(raman))
+
+cat("\nRaman positions:", length(raman_shift), "\n")
+cat("Spectra:", ncol(spectra), "\n")
+cat(
+  "Spectral range:",
+  min(raman_shift), "to", max(raman_shift),
+  "cm^-1\n"
+)
+```
+
+# 3. Construct experimental metadata
+
+Numeric prefixes such as `2-`, `3-`, etc. are ordering identifiers, not treatment identities. The final `1` in the sample code denotes replicate 1 in this dataset.
+
+```{r metadata}
+# ------------------------------------------------------------
+# Sample identity
+# ------------------------------------------------------------
+
+sample_id <- sub(
+  "^([0-9]+-)?(psu|sbu|psf|sbf|pvf|pvu)1__.*$",
+  "\\2",
+  cell_id
+)
+
+sample_id <- factor(
+  sample_id,
+  levels = c("psu", "psf", "pvu", "pvf", "sbu", "sbf")
+)
+
+# ------------------------------------------------------------
+# Biological state and fixation
+# ------------------------------------------------------------
+
+metadata <- data.frame(
+  cell_id = cell_id,
+  sample = sample_id,
+  stringsAsFactors = FALSE
+)
+
+metadata$cell_state <- case_when(
+  metadata$sample %in% c("psu", "psf") ~ "endospore",
+  metadata$sample %in% c("pvu", "pvf") ~ "vegetative",
+  TRUE ~ NA_character_
+)
+
+metadata$fixation <- case_when(
+  metadata$sample %in% c("psf", "pvf", "sbf") ~ "fixed",
+  metadata$sample %in% c("psu", "pvu", "sbu") ~ "unfixed",
+  TRUE ~ NA_character_
+)
+
+metadata$replicate <- 1L
+
+metadata$treatment <- case_when(
+  metadata$sample == "psu" ~ "pure spores, unfixed",
+  metadata$sample == "psf" ~ "pure spores, fixed",
+  metadata$sample == "pvu" ~ "pure vegetative cells, unfixed",
+  metadata$sample == "pvf" ~ "pure vegetative cells, fixed",
+  metadata$sample == "sbu" ~ "soil blank supernatant, unfixed",
+  metadata$sample == "sbf" ~ "soil blank supernatant, fixed",
+  TRUE ~ NA_character_
+)
+
+metadata$sample <- factor(
+  metadata$sample,
+  levels = c("psu", "psf", "pvu", "pvf", "sbu", "sbf")
+)
+
+metadata$cell_state <- factor(
+  metadata$cell_state,
+  levels = c("vegetative", "endospore")
+)
+
+metadata$fixation <- factor(
+  metadata$fixation,
+  levels = c("unfixed", "fixed")
+)
+
+# ------------------------------------------------------------
+# Full-data checks
+# ------------------------------------------------------------
+
+cat("Cells per sample:\n")
+print(table(metadata$sample, useNA = "ifany"))
+
+stopifnot(
+  length(raman_shift) == nrow(spectra),
+  ncol(spectra) == nrow(metadata),
+  identical(colnames(spectra), metadata$cell_id),
+  all(!is.na(metadata$sample)),
+  all(!is.na(metadata$fixation))
+)
+
+cat("\nMetadata validation passed.\n")
+```
+
+# 4. Define the biological 2 x 2 experiment
+
+Soil blanks are controls, not biological cells for the present question, and therefore are excluded from the 2 x 2 analysis.
+
+```{r biological_subset}
+biological_cells <- !is.na(metadata$cell_state)
+
+spectra_bio <- spectra[, biological_cells, drop = FALSE]
+metadata_bio <- droplevels(metadata[biological_cells, ])
+
+metadata_bio$group <- interaction(
+  metadata_bio$cell_state,
+  metadata_bio$fixation,
+  sep = "_",
+  drop = TRUE
+)
+
+cat("Biological spectra:", ncol(spectra_bio), "\n")
+cat("Raman positions:", nrow(spectra_bio), "\n")
+
+cat("\n2 x 2 experimental design:\n")
+print(table(metadata_bio$cell_state, metadata_bio$fixation))
+
+stopifnot(
+  ncol(spectra_bio) == nrow(metadata_bio),
+  identical(colnames(spectra_bio), metadata_bio$cell_id),
+  all(!is.na(metadata_bio$cell_state)),
+  all(!is.na(metadata_bio$fixation))
+)
+```
+
+# 5. Initial spectral QC: identify near-ceiling spectra
+
+The processed spectra contain a subset with very large contiguous regions near the upper end of the intensity scale. We used an empirical threshold of **63,000 intensity units** as a QC flag.
+
+This is a data-derived QC threshold, not a claim about the instrument's official detector ceiling. The collaborator memo therefore asks the instrument team to confirm what the processed intensity scale and true saturation limit are.
+
+```{r saturation_qc}
+# Number of Raman positions at or above the empirical near-ceiling threshold
+n_high <- colSums(spectra_bio >= 63000)
+
+spectrum_max <- apply(
+  spectra_bio,
+  2,
+  max,
+  na.rm = TRUE
+)
+
+qc <- data.frame(
+  cell_id = metadata_bio$cell_id,
+  sample = metadata_bio$sample,
+  cell_state = metadata_bio$cell_state,
+  fixation = metadata_bio$fixation,
+  spectrum_max = spectrum_max,
+  n_high = n_high
+)
+
+cat("\nSpectra with at least one value >= 63,000:\n")
+print(table(qc$n_high > 0))
+
+cat("\nDistribution of number of near-ceiling points:\n")
+print(quantile(
+  qc$n_high,
+  probs = c(0, .5, .9, .95, .99, .995, .999, 1)
+))
+
+cat("\nQC counts by biological group:\n")
+print(
+  qc %>%
+    mutate(near_ceiling = n_high > 0) %>%
+    count(cell_state, fixation, near_ceiling)
+)
+
+# Keep spectra without any near-ceiling point
+qc_pass <- qc$n_high == 0
+
+metadata_bio$n_high <- qc$n_high
+metadata_bio$spectrum_max <- qc$spectrum_max
+metadata_bio$qc_near_ceiling <- !qc_pass
+
+spectra_qc <- spectra_bio[, qc_pass, drop = FALSE]
+metadata_qc <- droplevels(metadata_bio[qc_pass, ])
+
+stopifnot(
+  ncol(spectra_qc) == nrow(metadata_qc),
+  identical(colnames(spectra_qc), metadata_qc$cell_id),
+  all(is.finite(spectra_qc))
+)
+
+cat("\nSpectra before QC:", ncol(spectra_bio), "\n")
+cat("Near-ceiling spectra removed:", sum(!qc_pass), "\n")
+cat("Spectra after QC:", ncol(spectra_qc), "\n")
+
+cat("\nFinal 2 x 2 design after QC:\n")
+print(table(metadata_qc$cell_state, metadata_qc$fixation))
+```
+
+# 6. CaDPA-associated Raman feature: descriptive benchmark
+
+A Raman position near **1016 cm^-1** is retained as a simple, biologically motivated benchmark for endospore classification.
+
+The measured Raman position nearest 1016 cm^-1 is identified directly from the imported axis rather than hard-coding a row number.
+
+## 6.1 Local baseline correction at the CaDPA-associated feature
+
+```{r cdpa_metric}
+# Measured Raman position nearest 1016 cm^-1
+peak_index <- which.min(abs(raman_shift - 1016))
+peak_shift <- raman_shift[peak_index]
+
+cat("Raman position nearest 1016 cm^-1:", peak_shift, "\n")
+
+# Local baseline anchors on either side of the peak
+left_region <- raman_shift >= 980 & raman_shift <= 995
+right_region <- raman_shift >= 1035 & raman_shift <= 1050
+
+left_intensity <- colMeans(
+  spectra_qc[left_region, , drop = FALSE]
+)
+
+right_intensity <- colMeans(
+  spectra_qc[right_region, , drop = FALSE]
+)
+
+left_shift <- mean(raman_shift[left_region])
+right_shift <- mean(raman_shift[right_region])
+
+# Linear interpolation between the two baseline regions
+baseline_at_peak <- left_intensity +
+  (right_intensity - left_intensity) *
+  ((peak_shift - left_shift) / (right_shift - left_shift))
+
+peak_intensity <- spectra_qc[peak_index, ]
+
+cdpa_peak <- peak_intensity - baseline_at_peak
+
+metadata_qc$cdpa_peak <- cdpa_peak
+
+cdpa_stats <- metadata_qc %>%
+  group_by(cell_state, fixation) %>%
+  summarise(
+    n = n(),
+    mean = mean(cdpa_peak),
+    median = median(cdpa_peak),
+    sd = sd(cdpa_peak),
+    q25 = quantile(cdpa_peak, .25),
+    q75 = quantile(cdpa_peak, .75),
+    p05 = quantile(cdpa_peak, .05),
+    p95 = quantile(cdpa_peak, .95),
+    .groups = "drop"
+  )
+
+print(cdpa_stats)
+```
+
+## 6.2 Visualize the benchmark
+
+```{r cdpa_plot, fig.width=7, fig.height=5}
+pdf(
+  file = file.path(output_dir, "Fig.1.pdf"),
+  width = 7,
+  height = 5
+)
+
+boxplot(
+  cdpa_peak ~ cell_state * fixation,
+  data = metadata_qc,
+  names = c(
+    "Vegetative\nUnfixed",
+    "Endospore\nUnfixed",
+    "Vegetative\nFixed",
+    "Endospore\nFixed"
+  ),
+  xlab = "",
+  ylab = expression("Baseline-corrected intensity near " * cm^{-1}),
+  main = "CaDPA-associated Raman peak"
+)
+
+abline(
+  h = 0,
+  lty = 2,
+  col = "gray60"
+)
+
+dev.off()
+```
+
+## 6.3 ROC/AUC benchmark
+
+The binary outcome is vegetative = 0 and endospore = 1. The ROC analysis is a **descriptive benchmark** for this replicate, not a claim of externally validated predictive performance.
+
+```{r cdpa_roc}
+metadata_qc$is_endospore <- ifelse(
+  metadata_qc$cell_state == "endospore",
+  1,
+  0
+)
+
+roc_all <- roc(
+  response = metadata_qc$is_endospore,
+  predictor = metadata_qc$cdpa_peak,
+  levels = c(0, 1),
+  direction = "<",
+  quiet = TRUE
+)
+
+unfixed <- metadata_qc$fixation == "unfixed"
+fixed <- metadata_qc$fixation == "fixed"
+
+roc_unfixed <- roc(
+  response = metadata_qc$is_endospore[unfixed],
+  predictor = metadata_qc$cdpa_peak[unfixed],
+  levels = c(0, 1),
+  direction = "<",
+  quiet = TRUE
+)
+
+roc_fixed <- roc(
+  response = metadata_qc$is_endospore[fixed],
+  predictor = metadata_qc$cdpa_peak[fixed],
+  levels = c(0, 1),
+  direction = "<",
+  quiet = TRUE
+)
+
+cat("All cells AUC:", round(as.numeric(auc(roc_all)), 3), "\n")
+cat("Unfixed AUC:", round(as.numeric(auc(roc_unfixed)), 3), "\n")
+cat("Fixed AUC:", round(as.numeric(auc(roc_fixed)), 3), "\n")
+
+cat("\n95% CI for AUC:\n")
+print(ci.auc(roc_all))
+print(ci.auc(roc_unfixed))
+print(ci.auc(roc_fixed))
+
+cat("\nUnfixed vs fixed ROC comparison:\n")
+print(roc.test(roc_unfixed, roc_fixed, paired = FALSE))
+```
+
+```{r cdpa_roc_plot, fig.width=7, fig.height=5}
+roc_all_x <- 1 - roc_all$specificities
+roc_all_y <- roc_all$sensitivities
+
+roc_unfixed_x <- 1 - roc_unfixed$specificities
+roc_unfixed_y <- roc_unfixed$sensitivities
+
+roc_fixed_x <- 1 - roc_fixed$specificities
+roc_fixed_y <- roc_fixed$sensitivities
+
+# ------------------------------------------------------------
+# Figure 2. ROC curves for CaDPA-based classification
+# ------------------------------------------------------------
+
+plot_fig2 <- function() {
+
+  plot(
+    roc_all_x,
+    roc_all_y,
+    type = "l",
+    lwd = 2,
+    xlim = c(0, 1),
+    ylim = c(0, 1),
+    xaxs = "i",
+    yaxs = "i",
+    xlab = "1 - Specificity",
+    ylab = "Sensitivity",
+    main = "Endospore classification using CaDPA Raman peak"
+  )
+
+  lines(
+    roc_unfixed_x,
+    roc_unfixed_y,
+    lwd = 2,
+    lty = 2
+  )
+
+  lines(
+    roc_fixed_x,
+    roc_fixed_y,
+    lwd = 2,
+    lty = 3
+  )
+
+  abline(
+    a = 0,
+    b = 1,
+    lty = 3,
+    col = "gray60"
+  )
+
+  legend(
+    "bottomright",
+    legend = c(
+      paste0(
+        "All cells (AUC = ",
+        round(as.numeric(auc(roc_all)), 3),
+        ")"
+      ),
+      paste0(
+        "Unfixed (AUC = ",
+        round(as.numeric(auc(roc_unfixed)), 3),
+        ")"
+      ),
+      paste0(
+        "Fixed (AUC = ",
+        round(as.numeric(auc(roc_fixed)), 3),
+        ")"
+      )
+    ),
+    lty = c(1, 2, 3),
+    lwd = 2,
+    bty = "n"
+  )
+}
+
+
+# Display Figure 2 in R Markdown
+plot_fig2()
+
+
+# Save Figure 2 as a PDF in 3.output
+pdf(
+  file = file.path(output_dir, "Fig.2.pdf"),
+  width = 7,
+  height = 5
+)
+
+plot_fig2()
+
+dev.off()
+```
+
+# 7. Whole-spectrum preprocessing: fingerprint region
+
+The main multivariate analysis uses the **600-1800 cm^-1 fingerprint region**. We do not use the full 336-4279 cm^-1 range here because the lower fingerprint region contains the strongest interpretable biochemical structure in the present analysis and limits the influence of broad high-wavenumber features.
+
+```{r fingerprint}
+fingerprint <- raman_shift >= 600 & raman_shift <= 1800
+
+raman_fingerprint <- raman_shift[fingerprint]
+spectra_fp <- spectra_qc[fingerprint, , drop = FALSE]
+
+cat("Fingerprint matrix dimensions:\n")
+print(dim(spectra_fp))
+```
+
+# 8. ALS baseline correction
+
+Baseline correction was necessary because L2-normalized spectra before baseline correction produced a PCA in which PC1 explained about 92% of total variance and was dominated by broad spectral/background structure.
+
+The working ALS parameters selected during the pilot were:
+
+- `lambda = 1e5`
+- `p = 0.01`
+- `niter = 10`
+
+The pilot was checked on endospore and vegetative spectra before being applied to all QC-passing cells.
+
+```{r als_function}
+# ------------------------------------------------------------
+# Asymmetric least-squares (ALS) baseline estimator
+# ------------------------------------------------------------
+
+als_baseline <- function(
+  y,
+  lambda = 1e5,
+  p = 0.01,
+  niter = 10
+) {
+
+  n <- length(y)
+
+  # Second-difference penalty matrix
+  D <- diff(Diagonal(n), differences = 2)
+
+  w <- rep(1, n)
+
+  for (i in seq_len(niter)) {
+
+    W <- Diagonal(x = w)
+
+    z <- solve(
+      W + lambda * crossprod(D),
+      w * y
+    )
+
+    z <- as.numeric(z)
+
+    # Down-weight points above the estimated baseline
+    w <- ifelse(y > z, p, 1 - p)
+  }
+
+  z
+}
+```
+
+## 8.1 Optional parameter check
+
+This small diagnostic can be rerun if a future dataset differs materially from this one. It is deliberately kept separate from the main pipeline because the present dataset already provided a working parameter choice.
+
+```{r als_pilot, eval=FALSE}
+set.seed(123)
+
+pilot_cells <- unlist(
+  lapply(
+    split(seq_len(ncol(spectra_qc)), metadata_qc$group),
+    function(x) sample(x, min(5, length(x)))
+  )
+)
+
+pilot_groups <- metadata_qc$group[pilot_cells]
+pilot_raw <- t(spectra_fp[, pilot_cells, drop = FALSE])
+
+example <- which(pilot_groups == "endospore_unfixed")[1]
+raw_example <- pilot_raw[example, ]
+
+baseline_1e4 <- als_baseline(raw_example, lambda = 1e4, p = 0.01)
+baseline_1e5 <- als_baseline(raw_example, lambda = 1e5, p = 0.01)
+baseline_1e6 <- als_baseline(raw_example, lambda = 1e6, p = 0.01)
+
+# ------------------------------------------------------------
+# Figure 3. ALS baseline comparison
+# ------------------------------------------------------------
+
+plot_fig3 <- function() {
+
+  plot(
+    raman_fingerprint,
+    raw_example,
+    type = "l",
+    lwd = 1.5,
+    xlab = expression("Raman shift (" * cm^{-1} * ")"),
+    ylab = "Intensity",
+    main = "ALS baseline comparison"
+  )
+
+  lines(
+    raman_fingerprint,
+    baseline_1e4,
+    lty = 2,
+    lwd = 2
+  )
+
+  lines(
+    raman_fingerprint,
+    baseline_1e5,
+    lty = 3,
+    lwd = 2
+  )
+
+  lines(
+    raman_fingerprint,
+    baseline_1e6,
+    lty = 4,
+    lwd = 2
+  )
+
+  legend(
+    "topright",
+    legend = c(
+      "Raw",
+      "lambda = 1e4",
+      "lambda = 1e5",
+      "lambda = 1e6"
+    ),
+    lty = c(1, 2, 3, 4),
+    lwd = c(1.5, 2, 2, 2),
+    bty = "n"
+  )
+}
+
+
+# Display Figure 3 in R Markdown
+plot_fig3()
+
+
+# Save Figure 3 as a PDF in 3.output
+pdf(
+  file = file.path(output_dir, "Fig.3.pdf"),
+  width = 7,
+  height = 5
+)
+
+plot_fig3()
+
+dev.off()
+```
+
+## 8.2 Apply ALS correction to all QC-passing spectra
+
+```{r als_full}
+cat("Starting ALS baseline correction...\n")
+
+spectra_bc <- apply(
+  spectra_fp,
+  2,
+  function(y) {
+    y - als_baseline(
+      y,
+      lambda = 1e5,
+      p = 0.01,
+      niter = 10
+    )
+  }
+)
+
+colnames(spectra_bc) <- colnames(spectra_fp)
+
+stopifnot(
+  ncol(spectra_bc) == nrow(metadata_qc),
+  identical(colnames(spectra_bc), metadata_qc$cell_id),
+  all(is.finite(spectra_bc))
+)
+
+cat("Baseline correction complete.\n")
+print(dim(spectra_bc))
+```
+
+# 9. L2/vector normalization after baseline correction
+
+Each cell spectrum is normalized independently by its Euclidean/L2 norm. This removes overall intensity scale while preserving the shape of each corrected spectrum.
+
+The order is important:
+
+**baseline correction -> L2 normalization**
+
+rather than normalizing first and then estimating the baseline.
+
+```{r l2_normalization}
+bc_norm <- sqrt(colSums(spectra_bc^2))
+
+stopifnot(all(bc_norm > 0))
+
+spectra_bc_norm <- sweep(
+  spectra_bc,
+  2,
+  bc_norm,
+  "/"
+)
+
+norm_check <- sqrt(colSums(spectra_bc_norm^2))
+
+cat("Normalized spectrum lengths:\n")
+print(summary(norm_check))
+
+stopifnot(all(abs(norm_check - 1) < 1e-10))
+
+cat("\nL2 normalization validated.\n")
+```
+
+# 10. Save the reproducible processing checkpoint
+
+Save processed objects to 3.output so that the computationally expensive baseline-correction step does not need to be repeated after restarting R.
+
+```{r save_checkpoint}
+saveRDS(
+  spectra_bc_norm,
+  file.path(output_dir, "spectra_bc_norm.rds")
+)
+
+saveRDS(
+  spectra_bc,
+  file.path(output_dir, "spectra_bc.rds")
+)
+
+saveRDS(
+  metadata_qc,
+  file.path(output_dir, "metadata_qc.rds")
+)
+
+saveRDS(
+  raman_fingerprint,
+  file.path(output_dir, "raman_fingerprint.rds")
+)
+
+cat("Processed Raman objects saved to:\n", output_dir, "\n")
+```
+
+# 11. Median spectra after baseline correction and normalization
+
+These medians provide an interpretable overview before moving to multivariate analysis.
+
+```{r median_spectra, fig.width=8, fig.height=5}
+metadata_qc$group <- interaction(
+  metadata_qc$cell_state,
+  metadata_qc$fixation,
+  sep = "_",
+  drop = TRUE
+)
+
+group_levels <- levels(metadata_qc$group)
+
+median_spectra_final <- sapply(
+  group_levels,
+  function(g) {
+    apply(
+      spectra_bc_norm[, metadata_qc$group == g, drop = FALSE],
+      1,
+      median
+    )
+  }
+)
+
+colnames(median_spectra_final) <- group_levels
+
+plot_colors <- group_colors[colnames(median_spectra_final)]
+
+# ------------------------------------------------------------
+# Figure 4. Median Raman spectra after preprocessing
+# ------------------------------------------------------------
+
+plot_fig4 <- function() {
+
+  matplot(
+    raman_fingerprint,
+    median_spectra_final,
+    type = "l",
+    lty = 1,
+    lwd = 1.5,
+    col = plot_colors,
+    xlab = expression("Raman shift (" * cm^{-1} * ")"),
+    ylab = "Normalized, baseline-corrected intensity",
+    main = "Median Raman spectra after preprocessing"
+  )
+
+  # Mark the CaDPA-associated Raman position
+  abline(
+    v = peak_shift,
+    lty = 2,
+    col = "gray60"
+  )
+
+  legend(
+    "topright",
+    legend = colnames(median_spectra_final),
+    col = plot_colors,
+    lty = 1,
+    lwd = 2,
+    bty = "n"
+  )
+}
+
+
+# Display Figure 4 in R Markdown
+plot_fig4()
+
+
+# Save Figure 4 as a PDF in 3.output
+pdf(
+  file = file.path(output_dir, "Fig.4.pdf"),
+  width = 7,
+  height = 5
+)
+
+plot_fig4()
+
+dev.off()
+```
+
+# 12. PCA of the corrected fingerprint spectra
+
+PCA is used here for **exploration and dimension reduction**, not as the final classifier.
+
+Rows in the PCA matrix are cells; columns are Raman positions.
+
+```{r pca}
+pca_input <- t(spectra_bc_norm)
+
+pca_final <- prcomp(
+  pca_input,
+  center = TRUE,
+  scale. = FALSE
+)
+
+variance_final <- 100 *
+  pca_final$sdev^2 /
+  sum(pca_final$sdev^2)
+
+cat("Variance explained by first 10 PCs:\n")
+print(round(variance_final[1:10], 2))
+
+pca_scores_final <- data.frame(
+  PC1 = pca_final$x[, 1],
+  PC2 = pca_final$x[, 2],
+  PC3 = pca_final$x[, 3],
+  PC4 = pca_final$x[, 4],
+  metadata_qc,
+  row.names = NULL
+)
+
+point_colors <- group_colors[
+  as.character(metadata_qc$group)
+]
+```
+
+## 12.1 PCA score plots
+
+```{r pca_scores, fig.width=8, fig.height=6}
+plot(
+  pca_scores_final$PC1,
+  pca_scores_final$PC2,
+  pch = 16,
+  cex = 0.5,
+  col = point_colors,
+  xlab = paste0("PC1 (", round(variance_final[1], 1), "%)"),
+  ylab = paste0("PC2 (", round(variance_final[2], 1), "%)"),
+  main = "PCA after baseline correction and normalization"
+)
+
+legend(
+  "topright",
+  legend = names(group_colors),
+  col = group_colors,
+  pch = 16,
+  bty = "n"
+)
+```
+
+```{r pca_scores_2, fig.width=8, fig.height=6}
+# ------------------------------------------------------------
+# Figure 5. PCA of preprocessed Raman spectra
+# ------------------------------------------------------------
+
+plot_fig5 <- function() {
+
+  # Two panels side-by-side
+  par(mfrow = c(1, 2))
+
+  # ----------------------------------------------------------
+  # Panel A: PC1 vs PC2
+  # ----------------------------------------------------------
+
+  plot(
+    pca_scores_final$PC1,
+    pca_scores_final$PC2,
+    pch = 16,
+    cex = 0.5,
+    col = point_colors,
+    xlab = paste0(
+      "PC1 (",
+      round(variance_final[1], 1),
+      "%)"
+    ),
+    ylab = paste0(
+      "PC2 (",
+      round(variance_final[2], 1),
+      "%)"
+    ),
+    main = "A"
+  )
+
+  legend(
+    "topright",
+    legend = names(group_colors),
+    col = group_colors,
+    pch = 16,
+    bty = "n",
+    cex = 0.8
+  )
+
+
+  # ----------------------------------------------------------
+  # Panel B: PC1 vs PC3
+  # ----------------------------------------------------------
+
+  plot(
+    pca_scores_final$PC1,
+    pca_scores_final$PC3,
+    pch = 16,
+    cex = 0.5,
+    col = point_colors,
+    xlab = paste0(
+      "PC1 (",
+      round(variance_final[1], 1),
+      "%)"
+    ),
+    ylab = paste0(
+      "PC3 (",
+      round(variance_final[3], 1),
+      "%)"
+    ),
+    main = "B"
+  )
+
+  legend(
+    "topright",
+    legend = names(group_colors),
+    col = group_colors,
+    pch = 16,
+    bty = "n",
+    cex = 0.8
+  )
+
+  # Reset plotting layout
+  par(mfrow = c(1, 1))
+}
+
+
+# Display Figure 5 in R Markdown
+plot_fig5()
+
+
+# Save Figure 5 as a PDF in 3.output
+pdf(
+  file = file.path(output_dir, "Fig.5.pdf"),
+  width = 12,
+  height = 5.5
+)
+
+plot_fig5()
+
+dev.off()
+```
+
+## 12.2 PCA loadings
+
+```{r pca_loadings, fig.width=8, fig.height=5}
+loadings_final <- data.frame(
+  raman_shift = raman_fingerprint,
+  PC1 = pca_final$rotation[, 1],
+  PC2 = pca_final$rotation[, 2],
+  PC3 = pca_final$rotation[, 3]
+)
+
+# ------------------------------------------------------------
+# Figure 6. PCA loadings after preprocessing
+# ------------------------------------------------------------
+
+plot_fig6 <- function() {
+
+  # Three panels side-by-side
+  par(mfrow = c(1, 3))
+
+  # ----------------------------------------------------------
+  # Panel A: PC1 loadings
+  # ----------------------------------------------------------
+
+  plot(
+    loadings_final$raman_shift,
+    loadings_final$PC1,
+    type = "l",
+    lwd = 1.5,
+    xlab = expression("Raman shift (" * cm^{-1} * ")"),
+    ylab = "Loading",
+    main = "A"
+  )
+
+  abline(
+    h = 0,
+    lty = 2,
+    col = "gray60"
+  )
+
+  abline(
+    v = peak_shift,
+    lty = 2,
+    col = "gray60"
+  )
+
+
+  # ----------------------------------------------------------
+  # Panel B: PC2 loadings
+  # ----------------------------------------------------------
+
+  plot(
+    loadings_final$raman_shift,
+    loadings_final$PC2,
+    type = "l",
+    lwd = 1.5,
+    xlab = expression("Raman shift (" * cm^{-1} * ")"),
+    ylab = "Loading",
+    main = "B"
+  )
+
+  abline(
+    h = 0,
+    lty = 2,
+    col = "gray60"
+  )
+
+  abline(
+    v = peak_shift,
+    lty = 2,
+    col = "gray60"
+  )
+
+
+  # ----------------------------------------------------------
+  # Panel C: PC3 loadings
+  # ----------------------------------------------------------
+
+  plot(
+    loadings_final$raman_shift,
+    loadings_final$PC3,
+    type = "l",
+    lwd = 1.5,
+    xlab = expression("Raman shift (" * cm^{-1} * ")"),
+    ylab = "Loading",
+    main = "C"
+  )
+
+  abline(
+    h = 0,
+    lty = 2,
+    col = "gray60"
+  )
+
+  abline(
+    v = peak_shift,
+    lty = 2,
+    col = "gray60"
+  )
+
+  # Reset plotting layout
+  par(mfrow = c(1, 1))
+}
+
+
+# Display Figure 6 in R Markdown
+plot_fig6()
+
+
+# Save Figure 6 as a PDF in 3.output
+pdf(
+  file = file.path(output_dir, "Fig.6.pdf"),
+  width = 15,
+  height = 5
+)
+
+plot_fig6()
+
+dev.off()
+```
+
+# 13. PCA summaries by biological group
+
+The PCA score summaries are descriptive. Because replicate 1 has treatment and acquisition time confounded, they should not be interpreted as independent tests of the treatment effect.
+
+```{r pca_group_summary}
+pc_group_summary <- pca_scores_final %>%
+  group_by(cell_state, fixation) %>%
+  summarise(
+    n = n(),
+    PC1_mean = mean(PC1),
+    PC1_sd = sd(PC1),
+    PC2_mean = mean(PC2),
+    PC2_sd = sd(PC2),
+    PC3_mean = mean(PC3),
+    PC3_sd = sd(PC3),
+    .groups = "drop"
+  )
+
+print(pc_group_summary)
+```
+
+# 14. Acquisition-time / run-effect diagnostics
+
+Cell identifiers contain acquisition timestamps. These are extracted and compared with PCA scores to determine whether apparent spectral substructure tracks acquisition history.
+
+This is a **diagnostic** section. We do not regress acquisition time out of the spectra because, in replicate 1, acquisition order is strongly confounded with treatment.
+
+```{r acquisition_time}
+# Example cell ID component:
+# ...processed20260818-131909.285
+
+time_string <- sub(
+  "^.*processed[0-9]{8}-([0-9]{6}\\.[0-9]+)$",
+  "\\1",
+  metadata_qc$cell_id
+)
+
+hh <- as.numeric(substr(time_string, 1, 2))
+mm <- as.numeric(substr(time_string, 3, 4))
+ss <- as.numeric(substr(time_string, 5, nchar(time_string)))
+
+metadata_qc$acquisition_seconds <- hh * 3600 + mm * 60 + ss
+
+stopifnot(all(!is.na(metadata_qc$acquisition_seconds)))
+
+pca_scores_final$acquisition_seconds <-
+  metadata_qc$acquisition_seconds
+
+# Correlation of each of the first three PCs with acquisition time,
+# calculated within sample so treatment is not mixed across groups.
+time_correlations <- pca_scores_final %>%
+  group_by(sample) %>%
+  summarise(
+    n = n(),
+    cor_PC1_time = cor(PC1, acquisition_seconds),
+    cor_PC2_time = cor(PC2, acquisition_seconds),
+    cor_PC3_time = cor(PC3, acquisition_seconds),
+    .groups = "drop"
+  )
+
+print(time_correlations)
+```
+
+## 14.1 Acquisition order plots
+
+```{r acquisition_order, fig.width=8, fig.height=7}
+# ------------------------------------------------------------
+# Figure 7. PC3 trajectories across acquisition order
+# ------------------------------------------------------------
+
+# Calculate acquisition order within each sample
+metadata_qc$acquisition_order <- ave(
+  metadata_qc$acquisition_seconds,
+  metadata_qc$sample,
+  FUN = function(x) rank(x, ties.method = "first")
+)
+
+pca_scores_final$acquisition_order <-
+  metadata_qc$acquisition_order
+
+
+# ------------------------------------------------------------
+# Plotting function
+# ------------------------------------------------------------
+
+plot_fig7 <- function() {
+
+  # Four panels
+  par(mfrow = c(2, 2))
+
+  for (s in levels(metadata_qc$sample)) {
+
+    idx <- metadata_qc$sample == s
+
+    plot(
+      pca_scores_final$acquisition_order[idx],
+      pca_scores_final$PC3[idx],
+      pch = 16,
+      cex = 0.4,
+      xlab = "Acquisition order",
+      ylab = "PC3 score",
+      main = s
+    )
+  }
+
+  # Reset plotting layout
+  par(mfrow = c(1, 1))
+}
+
+
+# ------------------------------------------------------------
+# Display Figure 7 in R Markdown
+# ------------------------------------------------------------
+
+plot_fig7()
+
+
+# ------------------------------------------------------------
+# Save Figure 7 as PDF in 3.output
+# ------------------------------------------------------------
+
+pdf(
+  file = file.path(output_dir, "Fig.7.pdf"),
+  width = 8,
+  height = 8
+)
+
+plot_fig7()
+
+dev.off()
+```
+
+## 14.2 Identify unusually long acquisition gaps
+
+A 60-second threshold is used here only as a **diagnostic flag** for conspicuous pauses. It is not treated as a definitive instrument-event definition.
+
+```{r acquisition_gaps}
+run_qc <- data.frame(
+  sample = metadata_qc$sample,
+  cell_id = metadata_qc$cell_id,
+  time = metadata_qc$acquisition_seconds,
+  PC1 = pca_final$x[, 1],
+  PC2 = pca_final$x[, 2],
+  PC3 = pca_final$x[, 3]
+) %>%
+  arrange(sample, time) %>%
+  group_by(sample) %>%
+  mutate(
+    acquisition_order = row_number(),
+    gap_seconds = time - lag(time)
+  ) %>%
+  ungroup()
+
+long_gaps <- run_qc %>%
+  filter(gap_seconds >= 60) %>%
+  select(
+    sample,
+    acquisition_order,
+    cell_id,
+    gap_seconds,
+    PC1,
+    PC2,
+    PC3
+  )
+
+print(long_gaps)
+
+cat("\nNumber of acquisition gaps >= 60 seconds by sample:\n")
+print(count(long_gaps, sample))
+```
+
+# 15. Important interpretation notes
+
+1. **The four biological groups are endospore/vegetative x fixed/unfixed.** Soil blanks are not part of the biological 2 x 2.
+
+2. **Near-ceiling spectra were removed before biological analysis.** The 63,000 threshold is an empirical QC flag and should be reconciled with the instrument team's documented signal range.
+
+3. **The CaDPA feature near 1016.826 cm^-1 is a useful benchmark but not the whole fingerprint.** Whole-spectrum PCA shows additional informative regions.
+
+4. **Baseline correction changes the multivariate representation substantially.** Before correction, PC1 dominated the PCA; after ALS correction and L2 normalization, variance is distributed across multiple PCs.
+
+5. **Acquisition/run structure is real in this dataset.** Some apparent PCA subclusters track acquisition order, including abrupt transitions following long acquisition gaps.
+
+6. **Treatment and acquisition are confounded in replicate 1.** Therefore replicate 1 is suitable for exploration and model development but is not sufficient to establish generalizable treatment effects or independently validated classification performance.
+
+7. **Future validation should be independent of acquisition block and, ideally, independent biological replicate.** A random cell-level train/test split would risk leakage because neighboring spectra can share acquisition-specific structure.
+
+# 16. Current analysis objects
+
+At completion, the main objects are:
+
+- `spectra_qc`: QC-passing spectra in the original full spectral range.
+- `spectra_bc`: ALS baseline-corrected spectra in the 600-1800 cm^-1 fingerprint region.
+- `spectra_bc_norm`: baseline-corrected + L2-normalized fingerprint spectra.
+- `metadata_qc`: metadata aligned exactly to columns of `spectra_qc` and `spectra_bc_norm`.
+- `pca_final`: PCA model of the corrected, normalized fingerprint spectra.
+- `pca_scores_final`: cell-level PCA scores plus metadata.
+- `run_qc`: acquisition-time diagnostics.
